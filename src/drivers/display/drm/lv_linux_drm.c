@@ -24,6 +24,9 @@
 
 #include "../../../stdlib/lv_sprintf.h"
 #include "../../../draw/lv_draw_buf.h"
+#include "../../../misc/lv_area.h"
+#include "../../../misc/lv_area_private.h"
+#include "../../../draw/sw/lv_draw_sw_utils.h"
 
 #if LV_USE_LINUX_DRM_GBM_BUFFERS
 
@@ -44,11 +47,40 @@
     #error LV_COLOR_DEPTH not supported
 #endif
 
-#define BUFFER_CNT 2
+/* Number of DRM framebuffers used for scanout.
+ *
+ * The original driver used two buffers (double buffering) with DIRECT
+ * render mode. We keep the count configurable here; 2 gives classic
+ * double buffering, 3 would be triple buffering, etc. The driver always
+ * renders into a separate LVGL draw buffer and only ever copies into the
+ * currently inactive DRM framebuffer before queuing it for scanout.
+ *
+ * You can override the default at compile time by defining
+ * LV_LINUX_DRM_BUFFER_CNT (for example via CFLAGS) before including this
+ * file. */
+#ifndef LV_LINUX_DRM_BUFFER_CNT
+    #define LV_LINUX_DRM_BUFFER_CNT 2
+#endif
+
+#define BUFFER_CNT LV_LINUX_DRM_BUFFER_CNT
 
 /**********************
  *      TYPEDEFS
  **********************/
+/* NOTE:
+ * This driver has been adapted to work with a separate LVGL draw buffer and
+ * software rotation on dumb DRM buffers. The original upstream version
+ * configured LVGL to render directly into the DRM framebuffers using
+ * LV_DISPLAY_RENDER_MODE_DIRECT and used drm_dmabuf_set_active_buf() +
+ * drm_flush_wait() to synchronize with atomic page flips.
+ *
+ * On this platform that combination triggered crashes when rotation was
+ * enabled (LVGL issue 6598), because LVGL's rotation path assumed a
+ * separate draw buffer. To avoid that, LVGL now renders into its own
+ * 800x480 buffer and this driver rotates that buffer into the 480x800
+ * dumb framebuffers in drm_flush().
+ */
+
 typedef struct {
     uint32_t handle;
     uint32_t pitch;
@@ -79,7 +111,15 @@ typedef struct {
     drmModePropertyPtr crtc_props[128];
     drmModePropertyPtr conn_props[128];
     drm_buffer_t drm_bufs[BUFFER_CNT];
+
+    /* The original driver used LV_DISPLAY_RENDER_MODE_DIRECT and tracked which
+     * DRM buffer LVGL was rendering into via act_buf. With the separate draw
+     * buffer approach act_buf is no longer used; instead we keep our own
+     * framebuffer index and optionally a rotated scratch buffer. */
     drm_buffer_t * act_buf;
+    uint32_t fb_index;        /* index of the next DRM buffer to display */
+    uint8_t * rotated_buf;    /* optional scratch buffer for rotated output */
+    size_t rotated_buf_size;
 #if LV_USE_LINUX_DRM_GBM_BUFFERS
     struct gbm_device * gbm_device;
 #endif
@@ -152,7 +192,13 @@ lv_display_t * lv_linux_drm_create(void)
         return NULL;
     }
     lv_display_set_driver_data(disp, drm_dev);
-    lv_display_set_flush_wait_cb(disp, drm_flush_wait);
+
+    /* Upstream driver also installed a flush-wait callback and used
+     * LV_DISPLAY_RENDER_MODE_DIRECT, letting LVGL render straight into the
+     * DRM framebuffers. In this variant LVGL uses a separate draw buffer in
+     * FULL mode and drm_flush() is responsible for copying (and rotating)
+     * that buffer into the mapped dumb buffers, so only the flush callback
+     * is registered here. */
     lv_display_set_flush_cb(disp, drm_flush);
 
     return disp;
@@ -164,44 +210,14 @@ lv_display_t * lv_linux_drm_create(void)
  * before the atomic commit */
 static void drm_dmabuf_set_active_buf(lv_event_t * event)
 {
-
-    drm_dev_t * drm_dev;
-    lv_display_t * disp;
-    lv_draw_buf_t * act_buf;
-    int i;
-
-    disp = (lv_display_t *) lv_event_get_current_target(event);
-    drm_dev = (drm_dev_t *) lv_display_get_driver_data(disp);
-    act_buf = lv_display_get_buf_active(disp);
-
-    if(drm_dev->act_buf == NULL) {
-
-        for(i = 0; i < BUFFER_CNT; i++) {
-            if(act_buf->unaligned_data == drm_dev->drm_bufs[i].map) {
-                drm_dev->act_buf = &drm_dev->drm_bufs[i];
-                LV_LOG_TRACE("Set active buffer idx: %d", i);
-                break;
-            }
-        }
-
-
-#if LV_USE_LINUX_DRM_GBM_BUFFERS
-
-        struct dma_buf_sync sync_req;
-        sync_req.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW;
-        int res;
-
-        if((res = ioctl(drm_dev->act_buf->handle, DMA_BUF_IOCTL_SYNC, &sync_req)) != 0) {
-            LV_LOG_ERROR("Failed to start DMA-BUF R/W SYNC res: %d", res);
-        }
-#endif
-
-    }
-    else {
-
-        LV_LOG_TRACE("active buffer already set");
-    }
-
+    /* In the original DIRECT-rendering implementation this callback told LVGL
+     * which DRM buffer was currently active so DMA-BUF sync IOCTLs could be
+     * issued before CPU access. The reworked driver always renders into a
+     * separate LVGL draw buffer (FULL render mode) and only copies into the
+     * DRM framebuffers inside drm_flush(), so there is no "active" scanout
+     * buffer for LVGL to write to anymore and this hook is effectively
+     * unused. It is kept as a no-op to preserve the public API. */
+    LV_UNUSED(event);
 }
 
 void lv_linux_drm_set_file(lv_display_t * disp, const char * file, int64_t connector_id)
@@ -215,9 +231,6 @@ void lv_linux_drm_set_file(lv_display_t * disp, const char * file, int64_t conne
         return;
     }
 
-    int32_t hor_res = drm_dev->width;
-    int32_t ver_res = drm_dev->height;
-
     ret = drm_setup_buffers(drm_dev);
     if(ret) {
         LV_LOG_ERROR("DRM buffer allocation failed");
@@ -230,18 +243,27 @@ void lv_linux_drm_set_file(lv_display_t * disp, const char * file, int64_t conne
 
     int32_t width = drm_dev->mmWidth;
 
-    size_t buf_size = LV_MIN(drm_dev->drm_bufs[1].size, drm_dev->drm_bufs[0].size);
-    /* Resolution must be set first because if the screen is smaller than the size passed
-     * to lv_display_create then the buffers aren't big enough for LV_DISPLAY_RENDER_MODE_DIRECT.
-     */
-    lv_display_set_resolution(disp, hor_res, ver_res);
-    lv_display_set_buffers(disp, drm_dev->drm_bufs[1].map, drm_dev->drm_bufs[0].map, buf_size,
-                           LV_DISPLAY_RENDER_MODE_DIRECT);
+    /* Allocate a separate LVGL draw buffer and use FULL render mode.
+     *
+     * Original upstream code called lv_display_set_resolution() with the
+     * DRM mode's width/height and then lv_display_set_buffers() with the
+     * two dumb framebuffers in LV_DISPLAY_RENDER_MODE_DIRECT. That made
+     * LVGL render directly into the DRM framebuffers, but also meant that
+     * LVGL's rotation and buffer reshaping paths (which assume a distinct
+     * draw buffer) could corrupt memory on this platform.
+     *
+     * Here we keep LVGL's logical resolution (800x480) and give it an
+     * internal draw buffer; drm_flush() is responsible for rotating and
+     * copying that buffer into the 480x800 DRM framebuffers. */
+    int32_t hor_res = lv_display_get_horizontal_resolution(disp);
+    int32_t ver_res = lv_display_get_vertical_resolution(disp);
+    lv_color_format_t cf = lv_display_get_color_format(disp);
+    uint32_t stride = lv_draw_buf_width_to_stride(hor_res, cf);
+    uint32_t buf_size = stride * ver_res;
 
-
-    /* Set the handler that is called before a redraw occurs to set the active buffer/plane
-     * when GBM buffers are used the DMA_BUF_SYNC_START is issued there */
-    lv_display_add_event_cb(disp, drm_dmabuf_set_active_buf, LV_EVENT_REFR_START, drm_dev);
+    uint8_t *draw_buf = lv_malloc(buf_size);
+    LV_ASSERT_MALLOC(draw_buf);
+    lv_display_set_buffers(disp, draw_buf, NULL, buf_size, LV_DISPLAY_RENDER_MODE_FULL);
 
     if(width) {
         lv_display_set_dpi(disp, DIV_ROUND_UP(hor_res * 25400, width * 1000));
@@ -983,27 +1005,24 @@ static int drm_setup_buffers(drm_dev_t * drm_dev)
     int ret;
 
 #if LV_USE_LINUX_DRM_GBM_BUFFERS
-
-    ret = create_gbm_buffer(drm_dev, &drm_dev->drm_bufs[0]);
-    if(ret < 0) {
-        return ret;
+    for(int i = 0; i < BUFFER_CNT; i++) {
+        ret = create_gbm_buffer(drm_dev, &drm_dev->drm_bufs[i]);
+        if(ret < 0) {
+            return ret;
+        }
     }
-
-    ret = create_gbm_buffer(drm_dev, &drm_dev->drm_bufs[1]);
-    if(ret < 0) {
-        return ret;
-    }
-
 #else
 
     /* Use dumb buffers */
-    ret = drm_allocate_dumb(drm_dev, &drm_dev->drm_bufs[0]);
-    if(ret)
-        return ret;
+    for(int i = 0; i < BUFFER_CNT; i++) {
+        ret = drm_allocate_dumb(drm_dev, &drm_dev->drm_bufs[i]);
+        if(ret)
+            return ret;
+    }
 
-    ret = drm_allocate_dumb(drm_dev, &drm_dev->drm_bufs[1]);
-    if(ret)
-        return ret;
+    drm_dev->fb_index = 0;
+    drm_dev->rotated_buf = NULL;
+    drm_dev->rotated_buf_size = 0;
 
 #endif
 
@@ -1035,21 +1054,46 @@ static void drm_flush_wait(lv_display_t * disp)
 
 static void drm_flush(lv_display_t * disp, const lv_area_t * area, uint8_t * px_map)
 {
-
-    if(!lv_display_flush_is_last(disp)) return;
-
     LV_UNUSED(area);
-    LV_UNUSED(px_map);
+
     drm_dev_t * drm_dev = lv_display_get_driver_data(disp);
-
-    LV_ASSERT(drm_dev->act_buf != NULL);
-
-    if(drm_dmabuf_set_plane(drm_dev, drm_dev->act_buf)) {
-        LV_LOG_ERROR("Flush fail");
+    if(!drm_dev) {
+        lv_display_flush_ready(disp);
         return;
     }
 
-    drm_dev->act_buf = NULL;
+    const lv_color_format_t cf = lv_display_get_color_format(disp);
+    const uint32_t px_size = lv_color_format_get_size(cf);
+
+    int32_t src_w = lv_display_get_horizontal_resolution(disp);
+    int32_t src_h = lv_display_get_vertical_resolution(disp);
+    uint32_t src_stride = lv_draw_buf_width_to_stride(src_w, cf);
+
+    /* Select back buffer and rotate the whole LVGL buffer into it.
+     *
+     * The LVGL UI is designed for 800x480, while the panel is mounted
+     * vertically as 480x800. Instead of asking LVGL to rotate its own
+     * draw buffer (which was not safe with DIRECT mode), we always render
+     * unrotated into the LVGL draw buffer and apply a fixed 270-degree
+     * rotation here when copying into the DRM framebuffers. */
+    drm_buffer_t * buf = &drm_dev->drm_bufs[drm_dev->fb_index];
+    drm_dev->fb_index = (drm_dev->fb_index + 1) % BUFFER_CNT;
+
+    /* Panel is mounted vertically (480x800), UI is 800x480: rotate 270 degrees. */
+    lv_draw_sw_rotate(px_map,
+                      buf->map,
+                      src_w,
+                      src_h,
+                      (int32_t)src_stride,
+                      (int32_t)buf->pitch,
+                      LV_DISPLAY_ROTATION_270,
+                      cf);
+
+    if(drm_dmabuf_set_plane(drm_dev, buf)) {
+        LV_LOG_ERROR("Flush fail");
+    }
+
+    lv_display_flush_ready(disp);
 
 }
 
