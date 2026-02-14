@@ -509,6 +509,7 @@ static int drm_dmabuf_set_plane(drm_dev_t * drm_dev, drm_buffer_t * buf)
     if(ret) {
         LV_LOG_ERROR("drmModeAtomicCommit failed: %s (%d)", strerror(errno), errno);
         drmModeAtomicFree(drm_dev->req);
+        drm_dev->req = NULL;
         return ret;
     }
 
@@ -1061,6 +1062,12 @@ static void drm_flush(lv_display_t * disp, const lv_area_t * area, uint8_t * px_
         lv_display_flush_ready(disp);
         return;
     }
+
+    /* Atomic commits are queued with NONBLOCK and retired from page-flip
+     * events. Wait for any in-flight commit to finish before queuing the next
+     * one, otherwise requests/events can pile up and eventually fail with
+     * ENOMEM on some DRM drivers. */
+    drm_flush_wait(disp);
 
     const lv_color_format_t cf = lv_display_get_color_format(disp);
     const uint32_t px_size = lv_color_format_get_size(cf);
