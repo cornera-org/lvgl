@@ -91,6 +91,12 @@ static lv_timer_t * event_handler_timer;
 /**********************
  *   GLOBAL FUNCTIONS
  **********************/
+__attribute__((weak)) void lvgl_request_quit(void);
+
+static bool has_app_quit_hook(void)
+{
+    return &lvgl_request_quit != NULL;
+}
 
 lv_display_t * lv_sdl_window_create(int32_t hor_res, int32_t ver_res)
 {
@@ -366,16 +372,20 @@ static void sdl_event_handler(lv_timer_t * t)
                     lv_refr_now(disp);
                     break;
                 case SDL_WINDOWEVENT_CLOSE:
-                    lv_display_delete(disp);
+                    if(has_app_quit_hook()) lvgl_request_quit();
+                    else lv_display_delete(disp);
                     break;
                 default:
                     break;
             }
         }
         if(event.type == SDL_QUIT) {
-            SDL_Quit();
-            lv_deinit();
-            inited = false;
+            if(has_app_quit_hook()) lvgl_request_quit();
+            else {
+                SDL_Quit();
+                lv_deinit();
+                inited = false;
+            }
 #if LV_SDL_DIRECT_EXIT
             exit(0);
 #endif
